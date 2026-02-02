@@ -1,0 +1,324 @@
+---
+title: "Yelp – Analiza sentymentu recenzji"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(jsonlite)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(stringr)
+library(purrr)
+library(httr2)
+library(knitr)
+```
+## Wprowadzenie
+
+Serwisy takie jak Yelp umożliwiają użytkownikom ocenę biznesów przy pomocy **ocen gwiazdkowych (1–5)** oraz **opisowych recenzji tekstowych**.
+Ocena gwiazdkowa jest syntetycznym, liczbowym podsumowaniem doświadczenia użytkownika, natomiast tekst recenzji zawiera bogatszy kontekst emocjonalny i opisowy.
+
+W ramach tego projektu analizowana jest **zgodność pomiędzy oceną gwiazdkową a sentymentem treści recenzji**, wyznaczanym automatycznie przy użyciu modeli NLP udostępnionych przez platformę Hugging Face.
+
+### Problem badawczy
+
+Czy sentyment wyrażony w treści recenzji tekstowej jest zgodny z oceną gwiazdkową nadaną przez użytkownika?
+
+### Hipoteza
+
+* wraz ze wzrostem liczby gwiazdek rośnie udział recenzji o sentymencie pozytywnym,
+* wraz ze spadkiem liczby gwiazdek rośnie udział recenzji o sentymencie negatywnym,
+* recenzje 3-gwiazdkowe mają największy udział sentymentu neutralnego (najbardziej “mieszane”).
+
+## Dane
+
+W analizie wykorzystano publicznie dostępny zbiór danych **Yelp Open Dataset**, obejmujący:
+- recenzje użytkowników (ocena gwiazdkowa, treść tekstowa),
+- metadane dotyczące biznesów (kategorie, lokalizacja, średnia ocena).
+
+Ze względu na ograniczenia czasowe i kosztowe API, analiza sentymentu wykonywana jest na **losowej próbce recenzji** pobranej z pełnego zbioru danych.
+
+## Metodologia
+
+1. Zbiór recenzji Yelp zostaje wczytany i poddany wstępnemu przetwarzaniu.
+2. Dla losowo wybranej próby* recenzji obliczany jest sentyment tekstu przy użyciu wybranego modelu NLP (Hugging Face Inference API).
+3. Każdej recenzji przypisywana jest etykieta sentymentu (NEGATIVE / NEUTRAL / POSITIVE).
+4. Analizowany jest rozkład sentymentu w zależności od liczby gwiazdek przyznanych przez użytkowników.
+5. Wyniki prezentowane są w formie wykresów i tabel agregujących dane.
+
+Analiza ma charakter **eksploracyjny** i służy weryfikacji spójności pomiędzy oceną liczbową a emocjonalnym wydźwiękiem treści recenzji.
+
+## Konfiguracja
+
+```{r config}
+REVIEW_PATH   <- "data/yelp_academic_dataset_review.json"
+BUSINESS_PATH <- "data/yelp_academic_dataset_business.json"
+
+NROWS <- 50000
+ANALYZE_LIMIT <- 100
+RANDOM_STATE <- 420
+
+MODEL_NAME <- "cardiffnlp/twitter-roberta-base-sentiment-latest"
+
+HF_TOKEN <- "HF_TOKEN"
+```
+
+## Wczytanie danych (JSONL)
+
+```{r load-jsonl, cache=TRUE}
+read_yelp_jsonl <- function(path, nrows) {
+  con <- file(path, open = "r", encoding = "UTF-8")
+  on.exit(close(con), add = TRUE)
+
+  lines <- readLines(con, n = nrows, warn = FALSE)
+
+  df <- jsonlite::fromJSON(paste0("[", paste(lines, collapse = ","), "]"))
+  as_tibble(df)
+}
+
+reviews_raw  <- read_yelp_jsonl(REVIEW_PATH, NROWS)
+business_raw <- read_yelp_jsonl(BUSINESS_PATH, NROWS)
+
+reviews <- reviews_raw %>%
+  select(review_id, user_id, business_id, stars, text)
+
+business <- business_raw %>%
+  select(business_id, name, address, city, state, postal_code,
+         latitude, longitude, stars, review_count, is_open, categories)
+
+glimpse(reviews)
+glimpse(business)
+```
+
+## Reviews – podgląd i statystyki
+
+```{r reviews-head}
+reviews_preview <- reviews %>%
+  mutate(text = str_trunc(text, width = 200)) %>%
+  head(5)
+
+kable(reviews_preview, escape = TRUE)
+```
+
+```{r reviews-metrics}
+reviews_metrics <- tibble::tibble(
+  `Liczba recenzji` = nrow(reviews),
+  `Średnia ocena gwiazdkowa` = round(mean(reviews$stars, na.rm = TRUE), 2),
+  `Liczba unikalnych biznesów` = n_distinct(reviews$business_id),
+  `Liczba unikalnych recenzentów` = n_distinct(reviews$user_id)
+)
+
+reviews_metrics |> kable()
+```
+
+## Business – podgląd i statystyki
+
+```{r business-head}
+head(business, 5) |> kable()
+```
+
+```{r business-metrics}
+business_metrics <- tibble::tibble(
+  `Liczba unikalnych biznesów` = n_distinct(business$business_id),
+  `Średnia ocena gwiazdkowa` = round(mean(business$stars, na.rm = TRUE), 2)
+)
+
+business_metrics |> kable()
+```
+
+### Rozkład ocen gwiazdkowych
+
+```{r business-stars-plot}
+x <- business %>%
+  count(stars, name = "count") %>%
+  arrange(stars)
+
+ggplot(x, aes(x = stars, y = count)) +
+  geom_col() +
+  labs(
+    title = "Rozkład ocen gwiazdkowych",
+    x = "Oceny gwiazdkowe",
+    y = "Liczba biznesów"
+  ) +
+  theme_minimal()
+```
+
+Wykres przedstawia rozkład średnich ocen gwiazdkowych dla biznesów dostępnych w zbiorze Yelp.
+Zauważalna jest koncentracja ocen w przedziale 3–4 gwiazdek, co sugeruje, że większość biznesów
+otrzymuje umiarkowanie pozytywne oceny, a skrajnie niskie i skrajnie wysokie oceny występują rzadziej.
+Można tu zauważyć stosunkowo silny bias w kierunku ocen pozytywnych.
+Z praktycznego punktu widzenia, biznesy dążą do uzyskania ocen w górnym zakresie skali, a dodatkowo
+można założyć, że przedsiębiorstwa z bardzo niskimi ocenami mogą być bardziej podatne na upadek - tracą na ważności
+
+### Topowe kategorie biznesów
+
+```{r business-cats-plot}
+cats <- business %>%
+  filter(!is.na(categories)) %>%
+  mutate(category = str_split(categories, ",\\s*")) %>%
+  tidyr::unnest(category) %>%
+  count(category, sort = TRUE)
+
+top_n <- 30
+cats_top <- cats %>% slice_head(n = top_n)
+
+ggplot(cats_top, aes(x = reorder(category, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = paste0("Top ", top_n, " kategorii biznesów"),
+    x = "Kategoria",
+    y = "Liczba biznesów"
+  ) +
+  theme_minimal()
+```
+
+Dominują kategorie powiązane z usługami lokalnymi i gastronomią. Warto pamiętać, że jeden biznes może mieć przypisanych wiele kategorii.
+
+## Analiza sentymentu (Hugging Face Inference API)
+
+### Funkcje API + analiza próbki
+
+```{r hf-functions, cache=TRUE}
+hf_text_classification <- function(text, model_name, token) {
+  url <- paste0("https://router.huggingface.co/hf-inference/models/", model_name)
+
+  req <- request(url) |>
+    req_headers(
+      Authorization = paste("Bearer", token),
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_json(list(inputs = text), auto_unbox = TRUE) |>
+    req_timeout(60) |>
+    req_error(is_error = function(resp) FALSE)
+
+  resp <- req_perform(req)
+
+  resp_body_json(resp, simplifyVector = FALSE)
+}
+
+pick_best_label <- function(result) {
+  classes <- result[[1]]
+
+  classes <- Filter(function(x) !is.null(x[["label"]]) && !is.null(x[["score"]]), classes)
+
+  scores <- vapply(classes, function(x) as.numeric(x[["score"]]), numeric(1))
+  best_i <- which.max(scores)
+
+  list(
+    label = classes[[best_i]][["label"]],
+    score = classes[[best_i]][["score"]]
+  )
+}
+
+analyze_reviews <- function(df, limit, seed, model_name, token) {
+  set.seed(seed)
+  n <- min(limit, nrow(df))
+  sample_df <- df %>% slice_sample(n = n)
+
+  results <- vector("list", n)
+
+  for (i in seq_len(n)) {
+    txt <- as.character(sample_df$text[i])
+
+    # shortening the text, so API doesnt error out
+    txt <- substr(txt, 1, 2000)
+
+    res <- hf_text_classification(txt, model_name, token)
+    best <- pick_best_label(res)
+
+    results[[i]] <- list(
+      hf_label = best$label,
+      hf_score = best$score
+    )
+
+    if (i %% 25 == 0) message("Przetworzono: ", i, " / ", n)
+  }
+
+  bind_cols(sample_df, bind_rows(results))
+}
+
+```
+
+```{r run-sentiment, cache=TRUE}
+analyzed <- analyze_reviews(
+  df = reviews,
+  limit = ANALYZE_LIMIT,
+  seed = RANDOM_STATE,
+  model_name = MODEL_NAME,
+  token = HF_TOKEN
+)
+
+head(analyzed[, c("stars", "hf_label", "hf_score")])
+```
+
+### Dystrybucja sentymentu względem ocen gwiazdkowych
+
+```{r sentiment-vs-stars-plot}
+pivot <- analyzed %>%
+  filter(!is.na(stars)) %>%
+  count(stars, hf_label, name = "count") %>%
+  tidyr::pivot_wider(names_from = hf_label, values_from = count, values_fill = 0) %>%
+  arrange(stars)
+
+pivot_long <- pivot %>%
+  tidyr::pivot_longer(-stars, names_to = "hf_label", values_to = "count")
+
+ggplot(pivot_long, aes(x = factor(stars), y = count, fill = hf_label)) +
+  geom_col() +
+  labs(
+    title = "Sentyment vs ocena gwiazdkowa (liczba recenzji)",
+    x = "Oceny gwiazdkowe",
+    y = "Liczba recenzji",
+    fill = "HF label"
+  ) +
+  theme_minimal()
+```
+
+Wykres pokazuje zależność pomiędzy oceną gwiazdkową a sentymentem treści recenzji. Widoczny jest wyraźny trend: wraz ze wzrostem liczby gwiazdek rośnie udział sentymentu pozytywnego, natomiast maleje udział sentymentu negatywnego.
+
+Oceny pośrednie (szczególnie 3 gwiazdki) charakteryzują się większym zróżnicowaniem sentymentu, jednak przeważają recenzje o sentymencie pozytywnym. Pokazuje to bias recenzji (recenzentów) w kierunku oceny pozytywnej, nawet przy umiarkowanych ocenach gwiazdkowych.
+
+Dodatkowo można zauważyć, że model w większości wypadków wykazuje się wysoką pewnością klasyfikacji, co sugeruje, że istnieją wyraźne sygnały sentymentalne zgodne z wskazujące na oceny gwiazdkowe.
+
+### Rozkład ocen gwiazdkowych w analizowanej próbie
+
+```{r sample-stars-plot}
+counts <- analyzed %>% count(stars, name = "count") %>% arrange(stars)
+
+ggplot(counts, aes(x = factor(stars), y = count)) +
+  geom_col() +
+  labs(
+    title = "Rozkład ocen gwiazdkowych w analizowanej próbie",
+    x = "Oceny gwiazdkowe",
+    y = "Liczba recenzji"
+  ) +
+  theme_minimal()
+```
+
+Rozkład ocen gwiazdkowych w analizowanej próbie recenzji odzwierciedla ogólną strukturę danych Yelp. Najczęściej występują oceny średnie i wysokie, co sugeruje, że użytkownicy chętniej dzielą się doświadczeniami umiarkowanie pozytywnymi lub pozytywnymi niż skrajnie negatywnymi.
+
+## Wnioski
+
+Na podstawie przeprowadzonej analizy można sformułować następujące wnioski:
+
+1. Istnieje wyraźna zależność pomiędzy oceną gwiazdkową a sentymentem treści recenzji. Recenzje o wysokiej liczbie gwiazdek są w większości nacechowane sentymentem pozytywnym, natomiast recenzje nisko oceniane częściej zawierają sentyment negatywny.
+
+2. Oceny pośrednie (szczególnie 3 gwiazdki) cechują się największym zróżnicowaniem sentymentu (mimo biasu w kierunku pozytywnego), co sugeruje, że użytkownicy wykorzystują tę ocenę do wyrażania mieszanych lub ambiwalentnych opinii.
+
+3. Wyniki potwierdzają, że analiza sentymentu tekstu recenzji może stanowić użyteczne uzupełnienie oceny liczbowej, dostarczając dodatkowego kontekstu interpretacyjnego.
+
+>Ze względu na losowy dobór próby oraz ograniczoną liczbę analizowanych recenzji, wnioski mają charakter eksploracyjny i dotyczą analizowanej próbki danych.
